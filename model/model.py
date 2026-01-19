@@ -1,5 +1,6 @@
 from transformers import PretrainedConfig
-
+import torch
+import torch.nn as nn
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
@@ -10,7 +11,7 @@ class MiniMindConfig(PretrainedConfig):
             bos_token_id: int = 1,
             eos_token_id: int = 2,
             hidden_act: str = 'silu',
-            hidden_size: int = 512,
+            dim: int = 512,
             intermediate_size: int = None,
             max_position_embeddings: int = 32768,
             num_attention_heads: int = 8,
@@ -40,7 +41,7 @@ class MiniMindConfig(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.hidden_act = hidden_act
-        self.hidden_size = hidden_size
+        self.dim = dim
         self.intermediate_size = intermediate_size
         self.max_position_embeddings = max_position_embeddings
         self.num_attention_heads = num_attention_heads
@@ -72,3 +73,31 @@ class MiniMindConfig(PretrainedConfig):
         self.aux_loss_alpha = aux_loss_alpha  # 辅助损失的alpha参数
         self.seq_aux = seq_aux  # 是否在序列级别上计算辅助损失
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
+
+
+# RMSNorm implementation
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        # 初始化参数权重, 使其能被优化
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _layerNorm(self, x):
+        # 计算均值和方差
+        mean = x.mean(-1, keepdim=True)
+        ## var 计算的是方差： E[(x - mean)^2]
+        var = x.var(-1, unbiased=False, keepdim=True)
+        return (x - mean) / torch.sqrt(var + self.eps)
+
+    def _norm(self, x):
+        # 计算均方值 (Mean Square) E[x^2]
+        # 使用 rsqrt (Reciprocal Square Root) 进行归一化: x * (1 / sqrt(mean(x^2) + eps))
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        # 为了数值稳定性，通常在 float32 下计算 Norm
+        #.type_as(x)确保类型不变
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
