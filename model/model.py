@@ -112,7 +112,7 @@ class RMSNorm(nn.Module):
 
 
 # RoPE+YaRN
-def precomput_freq_cis(
+def precompute_freqs_cis(
     dim: int,
     end: int = int(32 * 1024),
     rope_base: float = 1e6,
@@ -447,3 +447,83 @@ class MiniMindBlock(nn.Module):
             self.post_attention_layernorm(hidden_states)
         )
         return hidden_states, present_key_value
+
+
+class MiniMindModel(nn.Module):
+    def __init__(
+        self,
+        config: MiniMindConfig,
+    ):
+        super().__init__()
+        self.vocab_size = config.vocab_size
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList()
+        for layer_id in range(config.num_hidden_layers):
+            self.layers.append(MiniMindBlock(layer_id, config))
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # 输出的linear层
+        self.linear_proj = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.softmax = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(config.dropout)
+        # RoPE计算
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            dim=config.hidden_size // config.num_attention_heads,
+            end=config.max_position_embeddings,
+            rope_base=config.rope_base,
+            rope_scaling=config.rope_scaling,
+        )
+        # 注册缓冲区, 这些值不参与优化,但是会保存在模型中
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        position_embedding: Tuple[torch.Tensor, torch.Tensor],
+        past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache=False,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        bs, seq_len = input_ids.shape
+        if hasattr(past_key_values, 'layers'):
+            past_key_values = None  # 处理huggingface的兼容问题
+
+        # 为未计算的kv_cache添加None
+        past_key_values = past_key_values or [None] * len(self.layers)
+
+        # embedding
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        # 计算start_pos：如果存在past，则start_pos为已有past序列长度
+        start_pos = (
+            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        )
+        # 参与计算的部分添加位置编码
+        position_embeddings = self.dropout(
+            self.freqs_cos[start_pos : start_pos + seq_len],
+            self.freqs_sin[start_pos : start_pos + seq_len],
+        )
+
+        presents = []
+
+        for layer_idx, (layer, past_key_value) in enumerate(
+            zip(self.layers, past_key_values)
+        ):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask,
+            )
+            presents.append(present)
+
+        hidden_states = self.norm(hidden_states)
+
+        aux_loss = sum(
+            layer.mlp.aux_loss
+            for layer in self.layers
+            if isinstance(layer.mlp, MoEFeedForaward)
+        )
+
+        return hidden_states, presents, aux_loss
