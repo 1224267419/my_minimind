@@ -4,7 +4,14 @@ import torch.nn as nn
 import math
 from typing import Optional, Tuple
 import torch.nn.functional as F
-from .activations import ACT2FN
+import torch
+import math
+import torch.nn as nn
+from typing import Optional, Tuple, List, Union
+import torch.nn.functional as F
+from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class MiniMindConfig(PretrainedConfig):
@@ -450,6 +457,11 @@ class MiniMindBlock(nn.Module):
 
 
 class MiniMindModel(nn.Module):
+    """
+    # embedding->attention->norm
+
+    """
+
     def __init__(
         self,
         config: MiniMindConfig,
@@ -520,10 +532,52 @@ class MiniMindModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
 
-        aux_loss = sum(
-            layer.mlp.aux_loss
-            for layer in self.layers
-            if isinstance(layer.mlp, MoEFeedForaward)
-        )
+        return hidden_states, presents
 
-        return hidden_states, presents, aux_loss
+
+class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    # PreTrainedModel:提供模型管理标准
+    # GenerationMixin:提供生成pipeline
+    config_class = MiniMindConfig
+
+    def __init__(self, config: MiniMindConfig):
+        self.config = config or MiniMindConfig()
+        super().__init__(self.config)
+        # 标准做法,将model和lm_head分开,
+        self.model = MiniMindModel(self.config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # 输入层和输出层权重共享 , 因为是做embedding 和 反向embedding , 做矩阵转置即可
+        self.lm_head.weight = self.model.embed_tokens.weight
+
+        # hf封装的模型输出
+        self.OUT = CausalLMOutputWithPast()
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **args,
+    ):
+        hidden_states, past_key_values = self.model(
+            input_ids, attention_mask, past_key_values, use_cache, attention_mask
+        )
+        # 构造切片索引，用于决定保留 hidden_states 中哪些 token 的位置来计算 logits。
+        # 如果 logits_to_keep 是 整数 → 创建 slice(-logits_to_keep, None)
+        # 如果 logits_to_keep 是 其他类型（如 Tensor）→ 直接使用它作为索引
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)  # 判断是否为int,如果是tensor,则直接使用
+            else logits_to_keep
+        )
+        # 只解码hidden_states 要求的那个元素,即 slice_indices
+        # 例如logits_to_keep=1,则只解码hidden_states的最后一个元素 ,
+        # 例如logits_to_keep=0,则只解码hidden_states的所有元素
+        # 例如logits_to_keep=Tensor([1,3,10]),则只解码hidden_states的第1,3,10个元素
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        output = self.OUT(
+            logits=logits, past_key_values=past_key_values, hidden_states=hidden_states
+        )
+        return output
