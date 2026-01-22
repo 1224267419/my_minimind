@@ -536,6 +536,7 @@ class MiniMindModel(nn.Module):
 
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    # 采用transformer的标准模块,简化输出方式
     # PreTrainedModel:提供模型管理标准
     # GenerationMixin:提供生成pipeline
     config_class = MiniMindConfig
