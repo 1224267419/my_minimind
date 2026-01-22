@@ -1,12 +1,6 @@
-from transformers import PretrainedConfig
 import torch
 import torch.nn as nn
 import math
-from typing import Optional, Tuple
-import torch.nn.functional as F
-import torch
-import math
-import torch.nn as nn
 from typing import Optional, Tuple, List, Union
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
@@ -133,8 +127,9 @@ def precompute_freqs_cis(
     # 公式: theta_i = base^(-2i/dim) i是从0,d/2-1的index
     # 频率从高到低排列: freqs[0] 是最高频, freqs[-1] 是最低频
     # [:dim // 2] 避免边缘情况导致的形状不匹配
-    freqs, attn_factor = rope_base ** (
-        -torch.arange(0, dim, 2)[: dim // 2].float() / dim
+    freqs, attn_factor = (
+        rope_base ** (-torch.arange(0, dim, 2)[: dim // 2].float() / dim),
+        1.0,
     )
     # attn_factor :调节 Softmax 的“温度” , 修正处理比训练长度更长的序列时出现的注意力分布偏移问题(Entropy Shift)
     # 2. YaRN 上下文扩展逻辑 (如果配置了 rope_scaling)
@@ -211,8 +206,11 @@ def apply_rotary_pos_emb(xq, xk, freqs_cos, freqs_sin, unsqueeze_dim=1):
     # 假设输入 xq 为 [batch, seq, head, dim]
     # freqs_cos 原本为 [seq, dim] -> unsqueeze(1) -> [seq, 1, dim]
     # 这样可以自动广播到 [batch, seq, head, dim]
-    freqs_cos = freqs_cos.unsqueeze(unsqueeze_dim)
-    freqs_sin = freqs_sin.unsqueeze(unsqueeze_dim)
+    # 【修复关键】只扩展一次维度，并确保它对齐到 Seq 维度
+    # 目标形状: [1, Seq, 1, Dim]
+    # 这样它可以完美广播到 [Batch, Seq, Head, Dim]
+    freqs_cos = freqs_cos.unsqueeze(0).unsqueeze(2)  # [Seq, Dim] -> [1, Seq, 1, Dim]
+    freqs_sin = freqs_sin.unsqueeze(0).unsqueeze(2)  # [Seq, Dim] -> [1, Seq, 1, Dim]
 
     # 应用 Euler 公式展开后的旋转逻辑:
     # q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -220,12 +218,10 @@ def apply_rotary_pos_emb(xq, xk, freqs_cos, freqs_sin, unsqueeze_dim=1):
     # real = x1 * cos - x2 * sin
     # imag = x2 * cos + x1 * sin
     # 维度扩展是为了便于后续计算
-    xq_embed = (xq * freqs_cos.unsqueeze(unsqueeze_dim)) + (
-        rotate_half(xq) * freqs_sin.unsqueeze(unsqueeze_dim)
-    )
-    xk_embed = (xk * freqs_cos.unsqueeze(unsqueeze_dim)) + (
-        rotate_half(xk) * freqs_sin.unsqueeze(unsqueeze_dim)
-    )
+
+    # print(f"DEBUG: xq shape: {xq.shape}, freqs_cos shape: {freqs_cos.shape}")
+    xq_embed = (xq * freqs_cos) + (rotate_half(xq) * freqs_sin)
+    xk_embed = (xk * freqs_cos) + (rotate_half(xk) * freqs_sin)
 
     return xq_embed, xk_embed
 
@@ -239,7 +235,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         return x
     return (
         x[:, :, :, None, :]
-        .expend(bs, slen, kv_heads, n_rep, head_dim)
+        .expand(bs, slen, kv_heads, n_rep, head_dim)
         .reshape(bs, slen, kv_heads * n_rep, head_dim)
     )
 
@@ -321,8 +317,6 @@ class Attention(nn.Module):
             repeat_kv(xv, self.n_rep).transpose(1, 2),
         )
 
-        # 对k, v进行扩展
-        xk, xv = repeat_kv(xk, self.n_rep), repeat_kv(xv, self.n_rep)
         # 使用 flash attention
         if (
             self.flash
@@ -481,7 +475,7 @@ class MiniMindModel(nn.Module):
         freqs_cos, freqs_sin = precompute_freqs_cis(
             dim=config.hidden_size // config.num_attention_heads,
             end=config.max_position_embeddings,
-            rope_base=config.rope_base,
+            rope_base=config.rope_theta,
             rope_scaling=config.rope_scaling,
         )
         # 注册缓冲区, 这些值不参与优化,但是会保存在模型中
@@ -491,7 +485,6 @@ class MiniMindModel(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        position_embedding: Tuple[torch.Tensor, torch.Tensor],
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache=False,
         attention_mask: Optional[torch.Tensor] = None,
@@ -510,8 +503,8 @@ class MiniMindModel(nn.Module):
         start_pos = (
             past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
         )
-        # 参与计算的部分添加位置编码
-        position_embeddings = self.dropout(
+
+        position_embeddings = (
             self.freqs_cos[start_pos : start_pos + seq_len],
             self.freqs_sin[start_pos : start_pos + seq_len],
         )
@@ -551,7 +544,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.lm_head.weight = self.model.embed_tokens.weight
 
         # hf封装的模型输出
-        self.OUT = CausalLMOutputWithPast()
+        # self.OUT = CausalLMOutputWithPast()
 
     def forward(
         self,
@@ -578,7 +571,6 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         # 例如logits_to_keep=0,则只解码hidden_states的所有元素
         # 例如logits_to_keep=Tensor([1,3,10]),则只解码hidden_states的第1,3,10个元素
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        output = self.OUT(
+        return CausalLMOutputWithPast(
             logits=logits, past_key_values=past_key_values, hidden_states=hidden_states
         )
-        return output

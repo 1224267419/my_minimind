@@ -1,0 +1,6 @@
+*.pyc
+*.pth
+*.pt
+*.json
+*.jsonl
+*.log
